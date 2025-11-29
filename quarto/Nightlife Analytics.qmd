@@ -11,6 +11,7 @@ format:
 execute:
   warning: false 
   message: false
+output-dir: "docs"
 ---
 
 ![](nyc_night_street.jpg){width="900" fig-align="center"}
