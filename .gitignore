@@ -1,0 +1,20 @@
+# RStudio junk
+.Rproj.user/
+.Rhistory
+.RData
+.RDataTmp*
+*.RDataTmp*
+
+# Quarto / R Markdown output
+*_cache/
+*_files/
+*.html
+
+# Raw / large data (reproducible from code)
+data/tlc/
+data/yelp/
+data/tlc_zones/
+quarto/data/
+
+# Misc
+.DS_Store

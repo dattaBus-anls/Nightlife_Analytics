@@ -1,0 +1,2222 @@
+---
+title: "Nightlife_Analytics"
+author: "Apu Datta" 
+format:
+  html: 
+    toc: true            
+    toc-location: right  
+    toc-title: "Contents" 
+    toc-depth: 5          
+    code-fold: true
+execute:
+  warning: false 
+  message: false
+---
+
+![](nyc_night_street.jpg){width="900" fig-align="center"}
+*New York City nightlife transportation: Time_Square*
+
+### Introduction
+
+New York City’s nightlife is more than entertainment. It is a major driver of service jobs, late night transportation demand, and the perceived safety of busy streets. Bars, clubs, restaurants, and rideshares together shape when and where the city is most alive after dark. This project combines official TLC trip records with Yelp nightlife venues to study how COVID-19 reshaped that night time ecosystem.
+
+Our overarching question is: **How does nightlife activity-bars, entertainment, and rideshares drive urban economies and affect city safety?** To make this manageable, I focus on the sub-question: **Has COVID changed the way the city moves at night (8 PM–4 AM)?**
+
+Using 2019–2023 Yellow taxi and high volume for-hire vehicle (Uber/Lyft) trips, linked to Yelp bars and clubs at the taxi zone level, I track how night time mobility evolved through the pre-COVID, during-COVID, and post-COVID periods. The analysis combines data cleaning, exploratory visualization, and formal inference (bootstrapping and count models) to move from raw trips and venues to evidence about how nightlife and night mobility have structurally shifted in NYC.
+
+---
+
+### Executive Summary
+
+This project shows that COVID-19 caused a large and lasting shift in how New York City moves at night. Before the pandemic, night trips followed a classic nightlife curve: volumes rose from 8–10 PM, peaked around midnight, and declined slowly toward 3–4 AM. During COVID, this entire curve collapsed across all hours, with the sharpest declines after 10 PM. Only a small amount of essential late night travel remained.
+
+After COVID restrictions eased, night mobility rebounded strongly but unevenly. Hourly and weekend/weekday patterns reveal that early evening trips recovered the most, while the very late night peak stayed weaker than before. Boxplots of distance and duration show that trips became shorter and faster during COVID, then lengthened again post-COVID, but did not fully return to pre-COVID variability. Provider mix charts confirm a structural shift toward rideshares: Uber/Lyft (FHV/FHVHV) now dominate night trips even more than before, while Yellow cab share remains small.
+
+Spatial maps and nightlife vs. trips plots show that nightlife districts in Manhattan, Brooklyn, and Queens experienced the biggest collapses and the strongest rebounds. Yet the post-COVID to pre-COVID ratio map reveals that some zones have more than doubled their night trips, while others still lag behind. Finally, bootstrap confidence intervals and negative binomial IRR estimates prove that these changes are statistically significant, not random noise. Together, the evidence supports the conclusion that COVID fundamentally changed the volume, timing, and geography of NYC’s night time mobility, with direct implications for nightlife driven economic activity and for where and when the city feels “busy enough to feel safe” at night.
+
+---
+
+### Dataset and Methods: TLC Trips + Yelp Nightlife
+
+> **TLC Night Trips (2019–2023):** I use official TLC trip records for Yellow taxis and high-volume for-hire vehicles (FHV/FHVHV). For each year from 2019 to 2023, I select two months (June and December) and keep only trips with pickup times between 8 PM and 4 AM. After cleaning (valid distance, fare, and 1–180 minute duration), this produces a large sample of night trips with fields such as provider, pickup/dropoff zone (LocationID), distance, fare, and timestamps.
+
+> **Yelp Nightlife Venues:** I query the Yelp Fusion API once to retrieve bars, clubs, lounges, and nightlife venues in NYC and save the snapshot as nightlife_nyc.csv. Each venue includes name, rating, price tier, categories, and latitude/longitude. Venues are converted to spatial points and assigned to TLC taxi zones using the official TLC zone shapefile.
+
+> **Combined Zone Panel: ** TLC night trips are aggregated by taxi zone, month, provider, and COVID period and then joined to Yelp nightlife counts per zone. This produces a zone_panel dataset with, for each LocationID, the number of night trips, average distance/fare, number of nightlife venues, and average Yelp rating. This is used for the nightlife vs. trips scatter and the post/pre ratio map.
+
+> **Analysis of Datasets:**
+
+**night_trips_eda:> ** trip level data with extra features (pickup hour, day-of-week, weekend flag, COVID period) for EDA plots.
+
+**Nightly aggregation:** one row per night × period with total trips and average distance/duration for bootstrap and permutation tests.
+
+**Date–hour–zone panel:** counts of trips by date, hour, taxi zone, provider, weekend flag, and COVID period for Poisson / negative binomial IRR models.
+
+### Project Initialization and Environment Setup
+
+In this section, I set up the entire project environment in one place. I define the working directory, create the project folders, install and load all required R packages, set global R options, and initialize the key data paths that the rest of the analysis uses. This ensures the project runs consistently on any machine and that all later scripts can locate the TLC and Yelp data without errors.
+
+```{r}
+#| label: project_setup
+#| code-fold: true
+#| message: false
+#| warning: false
+
+# Set working directory
+setwd("D:/STA9750_Project/Nightlife_Analytics")
+
+# Create clean folder structure
+dir.create("data", showWarnings = FALSE)
+dir.create("data/tlc", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/yelp", recursive = TRUE, showWarnings = FALSE)
+dir.create("scripts", showWarnings = FALSE)
+dir.create("quarto", showWarnings = FALSE)
+
+# Install and load required packages
+required_pkgs <- c(
+"tidyverse", "lubridate", "arrow", "duckdb",
+"sf", "httr", "jsonlite", "scales"
+)
+
+for (p in required_pkgs) {
+if (!requireNamespace(p, quietly = TRUE)) {
+install.packages(p)
+}
+}
+
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(duckdb)
+library(sf)
+library(httr)
+library(jsonlite)
+library(scales)
+library(kableExtra)
+
+# Global options
+options(scipen = 999)
+options(stringsAsFactors = FALSE)
+
+# Key directories
+base_dir  <- "data"
+tlc_dir   <- file.path(base_dir, "tlc")
+yelp_dir  <- file.path(base_dir, "yelp")
+
+# Internal checks 
+folders <- list.files("data", recursive = TRUE) 
+timestamp <- Sys.time()                         
+
+# Final output 
+cat("✔ Project setup completed successfully.\n")
+```
+---
+
+#### Loading Night-Time TLC Trips (Yellow + Uber/Lyft, 3 Months × 3 Years)
+
+In this section, I build a focused sample of TLC trips for nightlife analysis. I download *official Yellow taxi and high-volume for-hire (Uber/Lyft, fhvhv)* trip files for 3 months per year (June, December) for 2019–2023. I keep only trips in the night window (8 PM–4 AM) and standardize the schema into a single night_trips_raw table that will later be linked to Yelp nightlife intensity at the taxi-zone level.
+
+```{r}
+#| label: tlc_loader
+#| code-fold: true
+#| message: true
+#| warning: true
+#| cache: false
+#| eval: true 
+
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(lubridate)
+library(glue)
+
+# Open DuckDB connection in memory (fast, temporary)
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+
+# Providers and months I use
+# Yellow taxis + FHVHV (Uber/Lyft)
+providers <- c("yellow", "fhvhv")
+
+# Two months per year (June & December) for 2019–2023
+months_all <- c(
+  "2019-06", "2019-12",
+  "2020-06", "2020-12",
+  "2021-06", "2021-12",
+  "2022-06", "2022-12",
+  "2023-06", "2023-12"
+)
+
+# cat("[debug] Number of providers:", length(providers), "\n")
+# cat("[debug] Number of months:   ", length(months_all), "\n")
+# cat("Year-month combinations used for TLC night analysis:\n")
+# print(months_all)
+
+# Helper: build TLC Parquet URL for a given provider + year-month
+tlc_url <- function(provider, ym) {
+  glue("https://d37ci6vzurychx.cloudfront.net/trip-data/{provider}_tripdata_{ym}.parquet")
+}
+
+# Function to download one TLC parquet (if needed) and read night trips
+fetch_tlc_night_month <- function(provider, ym, con) {
+
+  url <- tlc_url(provider, ym)
+
+  # Local file path under data/tlc/
+  local_path <- file.path(
+    tlc_dir,
+    glue("{provider}_tripdata_{ym}.parquet")
+  )
+  # Normalize path for DuckDB / SQL
+  local_path <- normalizePath(local_path, winslash = "/", mustWork = FALSE)
+
+  message("\n--- Fetching night trips for ", provider, " ", ym, " ---")
+  message("Remote URL:  ", url)
+  message("Local file : ", local_path)
+
+  # Download once if we don't already have the file
+  if (!file.exists(local_path)) {
+    dir.create(tlc_dir, recursive = TRUE, showWarnings = FALSE)
+    message("  ↳ downloading parquet to disk...")
+    download.file(url, destfile = local_path, mode = "wb", quiet = FALSE)
+  } else {
+    message("  ↳ using existing local parquet file")
+  }
+
+  # Choose the correct column names based on provider schema
+  pickup_col  <- dplyr::case_when(
+    provider == "yellow" ~ "tpep_pickup_datetime",
+    provider == "fhvhv"  ~ "pickup_datetime",
+    TRUE                 ~ "pickup_datetime"
+  )
+
+  dropoff_col <- dplyr::case_when(
+    provider == "yellow" ~ "tpep_dropoff_datetime",
+    provider == "fhvhv"  ~ "dropoff_datetime",
+    TRUE                 ~ "dropoff_datetime"
+  )
+
+  distance_col <- dplyr::case_when(
+    provider == "yellow" ~ "trip_distance",
+    provider == "fhvhv"  ~ "trip_miles",
+    TRUE                 ~ "trip_distance"
+  )
+
+  total_col <- dplyr::case_when(
+    provider == "yellow" ~ "total_amount",
+    provider == "fhvhv"  ~ "base_passenger_fare",
+    TRUE                 ~ "total_amount"
+  )
+
+  # Build provider-specific SQL that reads the LOCAL parquet file
+  sql <- glue("
+    SELECT
+      '{provider}' AS provider,
+      '{ym}'       AS ym,
+      {pickup_col}  AS pickup_time,
+      {dropoff_col} AS dropoff_time,
+      PULocationID,
+      DOLocationID,
+      {distance_col} AS distance_miles,
+      {total_col}    AS total_fare
+    FROM read_parquet('{local_path}')
+    WHERE
+      (
+        EXTRACT(hour FROM {pickup_col}) BETWEEN 20 AND 23
+        OR
+        EXTRACT(hour FROM {pickup_col}) BETWEEN 0 AND 4
+      )
+  ")
+
+  dbGetQuery(con, sql)
+}
+
+# Cache: only build night_trips_raw once
+night_trips_cache <- file.path(tlc_dir, "night_trips_raw.rds")
+
+if (file.exists(night_trips_cache)) {
+
+  cat("✔ Using cached TLC night trips:", night_trips_cache, "\n")
+  night_trips_raw <- readRDS(night_trips_cache)
+
+} else {
+
+  cat("⏳ Fetching TLC night trips from local/remote parquet...\n")
+
+  plan <- expand.grid(
+    provider = providers,
+    ym       = months_all,
+    stringsAsFactors = FALSE
+  )
+
+  night_list <- vector("list", nrow(plan))
+
+  for (i in seq_len(nrow(plan))) {
+    night_list[[i]] <- fetch_tlc_night_month(
+      provider = plan$provider[i],
+      ym       = plan$ym[i],
+      con      = con
+    )
+  }
+
+  night_trips_raw <- dplyr::bind_rows(night_list)
+
+  saveRDS(night_trips_raw, night_trips_cache)
+  cat("✅ Saved TLC night trips to:", night_trips_cache, "\n")
+}
+
+# cat("\nPreview of TLC night trips:\n")
+# print(head(night_trips_raw))
+
+# Combined debug output in one code box
+cat("
+[debug] Number of providers: ", length(providers), "
+[debug] Number of months:    ", length(months_all), "
+Year-month combinations used for TLC night analysis:
+", paste(months_all, collapse = ", "), "
+✔ Using cached TLC night trips: ", night_trips_cache, "
+")
+
+# TABLE PREVIEW 
+cat("\nPreview of TLC night trips:\n")
+
+# Pretty table (static HTML table)
+knitr::kable(
+  head(night_trips_raw, 10),
+  format = "html",
+  caption = "Preview of TLC Night Trips"
+)
+
+```
+---
+
+#### Fetching Yelp Nightlife Data via Yelp API
+
+This section pulls a snapshot of NYC nightlife venues from the Yelp Fusion API. I save the data once into data/yelp/nightlife_nyc.csv, so I don’t keep hitting the API. If the file already exists, I simply load it from disk for reproducibility.
+
+
+```{r}
+#| label: yelp_api_loader
+#| code-fold: true
+#| message: true
+#| warning: true
+
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(readr)
+library(tidyr)
+
+dir.create(yelp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Safe extract helpers
+safe_extract <- function(x, field) {
+  if (is.null(x) || !is.list(x)) return(NA)
+  val <- x[[field]]
+  if (is.null(val)) return(NA)
+  unlist(val)[1]
+}
+
+yelp_nightlife_nyc <- function(
+  term        = "nightlife",
+  categories  = "bars,nightlife",
+  location    = "New York, NY",
+  max_results = 200,
+  save_path   = file.path(yelp_dir, "nightlife_nyc.csv"),
+  refetch     = FALSE
+) {
+
+  if (file.exists(save_path) && !refetch) {
+    message("✔ Using existing Yelp nightlife file: ", save_path)
+    return(readr::read_csv(save_path, show_col_types = FALSE))
+  }
+
+  api_key <- Sys.getenv("YELP_API_KEY")
+  if (identical(api_key, "")) stop("❌ Missing Yelp API Key.")
+
+  base_url <- "https://api.yelp.com/v3/businesses/search"
+  per_page <- 50
+  offsets  <- seq(0, max_results - 1, by = per_page)
+
+  records <- list()
+
+  for (off in offsets) {
+
+    resp <- request(base_url) |>
+      req_headers(Authorization = paste("Bearer", api_key)) |>
+      req_url_query(
+        term       = term,
+        categories = categories,
+        location   = location,
+        limit      = per_page,
+        offset     = off
+      ) |>
+      req_perform()
+
+    if (resp_status(resp) != 200) break
+
+    json <- resp_body_json(resp, simplifyVector = FALSE)
+
+    businesses <- json$businesses
+    if (length(businesses) == 0) break
+
+    cleaned <- map_df(businesses, function(b) {
+      tibble(
+        id            = b$id,
+        name          = b$name,
+        rating        = b$rating,
+        review_count  = b$review_count,
+        price         = b$price %||% NA,
+        categories_str= paste(map_chr(b$categories, "title"), collapse="; "),
+        lat           = safe_extract(b$coordinates, "latitude"),
+        lon           = safe_extract(b$coordinates, "longitude"),
+        city          = safe_extract(b$location, "city"),
+        state         = safe_extract(b$location, "state"),
+        zip_code      = safe_extract(b$location, "zip_code"),
+        url           = b$url,
+        is_closed     = b$is_closed
+      )
+    })
+
+    records[[length(records)+1]] <- cleaned
+    Sys.sleep(0.5)
+  }
+
+  final <- bind_rows(records)
+  readr::write_csv(final, save_path)
+
+  message("✅ Saved Yelp nightlife snapshot to: ", save_path)
+  final
+}
+
+# Yelp API key is loaded from your .Renviron file:
+# YELP_API_KEY="your-real-key"
+# See: Sys.getenv("YELP_API_KEY") to confirm it's available.
+
+
+# Fetch fresh Yelp data (force refetch = TRUE)
+yelp_df <- yelp_nightlife_nyc(
+  max_results = 200,
+  save_path = file.path(yelp_dir, "nightlife_nyc.csv"),
+  refetch = TRUE
+)
+
+# Make price safer for Quarto (avoid $ causing LaTeX issues)
+yelp_preview <- yelp_df %>%
+  mutate(
+    price = gsub("\\$", "USD ", price)
+  ) %>%
+  head(20)
+
+knitr::kable(
+  yelp_preview,
+  caption = "Preview of Yelp Nightlife Venues (Sample)"
+)
+
+```
+
+---
+
+#### Linking TLC Night Trips with Yelp Nightlife Data
+
+In this section, I connect my TLC night-time trips to Yelp nightlife intensity at the taxi-zone level. I read the official TLC taxi-zone shapefile, convert Yelp venues to spatial points, assign each venue to a taxi zone, and count the number of nightlife venues per zone. Then I aggregate TLC night trips by zone, month, and provider, and combine both sources into a zone_panel dataset that I will use later for my EDA.
+
+```{r}
+#| label: link_tlc_yelp_zones
+#| eval: true
+#| message: true
+#| warning: true
+#| code-fold: true
+
+library(sf)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# I define where the TLC taxi-zone zip should live and make sure the folder exists
+
+taxi_zip <- file.path(base_dir, "tlc_zones.zip")
+taxi_dir <- file.path(base_dir, "tlc_zones")
+dir.create(taxi_dir, showWarnings = FALSE)
+
+# I download the official TLC taxi-zone shapefile once and reuse it later
+
+if (!file.exists(taxi_zip)) {
+cat("\n[download] TLC taxi zone shapefile\n")
+download.file("https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip",
+taxi_zip,
+mode = "wb"
+)
+unzip(taxi_zip, exdir = taxi_dir)
+} else {
+cat("\n[skip] Using existing TLC taxi zone zip\n")
+}
+
+# I read the taxi zones as sf polygons and keep only the fields I need
+
+zones_sf <- st_read(
+dsn   = taxi_dir,
+layer = "taxi_zones",
+quiet = TRUE
+) |>
+st_transform(4326) |>
+select(LocationID, borough = borough, zone = zone)
+
+# cat("\nSample of TLC taxi zones:\n")
+# print(head(zones_sf))
+
+
+cat("\nSample of TLC taxi zones:\n")
+
+knitr::kable(
+  head(zones_sf, 6),
+  format = "html",
+  caption = "Sample of TLC Taxi Zones"
+)
+
+# I convert my Yelp nightlife dataframe to sf points using longitude/latitude
+
+yelp_sf <- yelp_df |>
+filter(!is.na(lat), !is.na(lon)) |>
+st_as_sf(
+coords = c("lon", "lat"),
+crs    = 4326,
+remove = FALSE
+)
+
+cat("\nSample of Yelp nightlife venues (sf points):\n")
+
+# Make a clean preview table: no geometry, no raw "$$"
+yelp_sf_preview <- yelp_sf |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    # Replace "$" with "USD " so Quarto does not think "$$" is math
+    price = gsub("\\$", "USD ", price)
+  ) |>
+  dplyr::select(
+    name, rating, review_count, price,
+    categories_str, city, state, zip_code
+  ) |>
+  head(6)
+
+knitr::kable(
+  yelp_sf_preview,
+  caption = "Sample of Yelp Nightlife Venues (sf points)"
+)
+
+# I assign each Yelp venue to a taxi zone using a spatial join
+
+yelp_zoned <- st_join(yelp_sf, zones_sf, join = st_within)
+
+
+cat("\nYelp venues with assigned taxi zones (if any):\n")
+
+# Clean preview: drop geometry, fix price, keep only key columns
+yelp_zoned_preview <- yelp_zoned |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    price = gsub("\\$", "USD ", price)
+  ) |>
+  dplyr::select(
+    name, rating, review_count, price,
+    borough, zone
+  ) |>
+  head(6)
+
+knitr::kable(
+  yelp_zoned_preview,
+  caption = "Yelp Venues with Assigned Taxi Zones"
+)
+
+# For aggregation, I drop the geometry and keep only attributes
+
+yelp_zoned_df <- yelp_zoned |>
+st_drop_geometry()
+
+# I count how many nightlife venues fall into each taxi zone
+
+nightlife_by_zone <- yelp_zoned_df |>
+group_by(LocationID, borough, zone) |>
+summarize(
+n_nightlife = n(),
+avg_rating  = mean(rating, na.rm = TRUE),
+.groups     = "drop"
+)
+
+# cat("\nNightlife venues per taxi zone:\n")
+# print(head(nightlife_by_zone))
+
+cat("\nNightlife venues per taxi zone:\n")
+
+knitr::kable(
+  head(nightlife_by_zone, 6),
+  format = "html",
+  caption = "Nightlife Venues per Taxi Zone"
+)
+
+# I define a small helper to tag each month-year into a COVID period
+# I define a small helper to tag each month-year into a COVID period (vectorized)
+
+covid_period_from_ym <- function(ym) {
+  year <- as.integer(substr(ym, 1, 4))
+
+  dplyr::case_when(
+    year <  2020 ~ "pre_covid",
+    year == 2020 ~ "during_covid",
+    year >  2020 ~ "post_covid",
+    TRUE         ~ NA_character_
+  )
+}
+
+# I clean my night-time TLC trips and add period + trip duration
+
+# Take a large random sample to avoid memory issues
+sample_size <- min(2e6, nrow(night_trips_raw))  # you can lower 2e6 to 1e6 if needed
+
+night_trips_clean <- night_trips_raw |>
+  # keep only the columns I actually need
+  dplyr::select(
+    ym,
+    pickup_time,
+    dropoff_time,
+    PULocationID,
+    distance_miles,
+    total_fare,
+    provider
+  ) |>
+  # random sample BEFORE creating new columns (saves a lot of RAM)
+  dplyr::slice_sample(n = sample_size) |>
+  mutate(
+    period       = covid_period_from_ym(ym),
+    trip_minutes = as.numeric(difftime(dropoff_time, pickup_time, units = "mins"))
+  ) |>
+  filter(
+    !is.na(PULocationID),
+    !is.na(distance_miles),
+    !is.na(total_fare),
+    distance_miles > 0,
+    total_fare    > 0,
+    trip_minutes >= 1,
+    trip_minutes <= 180
+  )
+
+# cat("\nPreview of cleaned TLC night trips:\n")
+# print(head(night_trips_clean))
+
+cat("\nPreview of cleaned TLC night trips:\n")
+
+knitr::kable(
+  head(night_trips_clean, 6),
+  format = "html",
+  caption = "Preview of Cleaned TLC Night Trips"
+)
+
+# I aggregate TLC night trips by pickup zone, year-month, period, and provider
+
+trips_by_zone_period <- night_trips_clean |>
+group_by(LocationID = PULocationID, ym, period, provider) |>
+summarize(
+n_trips      = n(),
+avg_distance = mean(distance_miles, na.rm = TRUE),
+avg_fare     = mean(total_fare,     na.rm = TRUE),
+.groups      = "drop"
+)
+
+# cat("\nNight trips per zone, month, period, provider:\n")
+# print(head(trips_by_zone_period))
+
+cat("\nNight trips per zone, month, period, provider:\n")
+
+knitr::kable(
+  head(trips_by_zone_period, 6),
+  format = "html",
+  caption = "Night Trips per Zone, Month, Period, Provider"
+)
+
+# I now join TLC night trips with nightlife intensity to build a zone-level panel
+
+zone_panel <- trips_by_zone_period |>
+left_join(nightlife_by_zone, by = "LocationID") |>
+mutate(
+n_nightlife = replace_na(n_nightlife, 0L),
+nightlife_bin = case_when(
+n_nightlife == 0      ~ "No nightlife venues",
+n_nightlife <= 5      ~ "1–5 venues",
+n_nightlife <= 15     ~ "6–15 venues",
+n_nightlife > 15      ~ "16+ venues",
+TRUE                  ~ NA_character_
+)
+)
+
+cat("\nCombined zone-level panel (TLC trips + nightlife intensity):\n")
+
+knitr::kable(
+  head(zone_panel, 6),
+  format = "html",
+  caption = "Zone-Level Panel: TLC Trips + Nightlife Intensity"
+)
+
+zone_panel_path <- file.path(base_dir, "tlc_zone_panel.rds")
+saveRDS(zone_panel, zone_panel_path)
+cat("\nSaved zone_panel to ", zone_panel_path, "\n")
+```
+
+---
+
+```{r}
+#| label: load_zone_panel
+#| echo: false
+#| message: true
+#| warning: false
+
+# During render I only need the final panel, not the huge raw trips
+
+zone_panel <- readRDS(file.path(base_dir, "tlc_zone_panel.rds"))
+cat("Loaded pre-aggregated zone_panel with", nrow(zone_panel), "rows, and",
+ncol(zone_panel), "columns\n")
+```
+
+---
+
+##### This does:
+
+- Reads **taxi_zones** again and keeps: `LocationID`, `borough`, `zone`
+- Left-joins those names into `zone_panel`
+- If `borough` or `zone` in `zone_panel` is `NA`, it fills it from the shapefile
+- Now *every* `LocationID` that exists in TLC will have a borough + zone name
+
+```{r}
+library(sf)
+library(dplyr)
+
+taxi_dir <- file.path(base_dir, "tlc_zones")
+
+# Read TLC zones with names (no geometry needed for this step)
+zones_meta <- st_read(
+  dsn   = taxi_dir,
+  layer = "taxi_zones",
+  quiet = TRUE
+) %>%
+  st_drop_geometry() %>%
+  select(LocationID, borough, zone)
+
+# Join names onto zone_panel and fill NAs
+zone_panel <- zone_panel %>%
+  left_join(zones_meta, by = "LocationID", suffix = c("", "_from_sf")) %>%
+  mutate(
+    borough = if_else(is.na(borough), borough_from_sf, borough),
+    zone    = if_else(is.na(zone),    zone_from_sf,    zone)
+  ) %>%
+  select(-borough_from_sf, -zone_from_sf)
+
+cat("\nCheck borough/zone after filling from TLC zones:\n")
+zone_panel %>%
+  select(LocationID, borough, zone, n_nightlife, period, n_trips) %>%
+  head() %>%
+  print()
+
+```
+
+---
+
+#### Data Quality Overview by COVID Period
+
+In this section, I summarize basic data quality for my night-time TLC trips by COVID period using a large random sample. This keeps memory usage manageable while still giving a reliable view of missingness patterns.
+
+```{r}
+# Helper to tag each year-month with a COVID period
+
+covid_period_from_ym <- function(ym) {
+year <- as.integer(substr(ym, 1, 4))
+
+dplyr::case_when(
+year <  2020 ~ "pre_covid",
+year == 2020 ~ "during_covid",
+year >  2020 ~ "post_covid",
+TRUE         ~ NA_character_
+)
+}
+
+# To avoid memory issues, I take a large random sample of the raw night trips
+
+# and only keep the columns needed for data-quality checks.
+
+sample_n <- min(1e6, nrow(night_trips_raw))  # cap at 1 million rows
+
+night_trips_sample <- night_trips_raw %>%
+dplyr::select(ym, PULocationID, distance_miles, total_fare, provider) %>%
+dplyr::slice_sample(n = sample_n) %>%
+mutate(
+period = covid_period_from_ym(ym)
+)
+
+# Summarize basic data quality by COVID period on this sample
+
+data_quality_period <- night_trips_sample %>%
+group_by(period) %>%
+summarize(
+n_trips_sample        = n(),
+pct_na_pu_location    = mean(is.na(PULocationID)) * 100,
+pct_na_distance       = mean(is.na(distance_miles)) * 100,
+pct_na_total_fare     = mean(is.na(total_fare)) * 100,
+.groups               = "drop"
+)
+
+cat("\nNight-time TLC data quality by COVID period (sample of raw trips):\n")
+# print(data_quality_period)
+knitr::kable(
+  data_quality_period,
+  format = "html",
+  caption = "Night-Time TLC Data Quality by COVID Period (Sample)",
+  digits = 2
+)
+```
+
+The TLC night-trip dataset shows exceptional data completeness across all COVID periods. In a 1 million–row random sample, key fields (PULocationID, distance, fare) have 0% missingness. This indicates high reporting quality and minimal risk of missing-data bias.
+
+---
+
+#### Outlier Filtering and Trip Retention
+
+In this section, I take a single random sample of night-time TLC trips and apply my cleaning rules to that same sample. This lets me correctly report how many trips are kept or removed by COVID period and provider.
+
+```{r}
+# I draw one sample from the raw night trips and keep only the columns I need
+
+sample_size_qc <- min(1e6, nrow(night_trips_raw))  # cap at 1 million
+
+night_qc_raw <- night_trips_raw %>%
+dplyr::select(
+ym,
+pickup_time,
+dropoff_time,
+PULocationID,
+distance_miles,
+total_fare,
+provider
+) %>%
+dplyr::slice_sample(n = sample_size_qc) %>%
+mutate(
+period       = covid_period_from_ym(ym),
+trip_minutes = as.numeric(difftime(dropoff_time, pickup_time, units = "mins"))
+)
+
+# I apply the same validity filters I used in my main cleaning pipeline
+
+night_qc_clean <- night_qc_raw %>%
+filter(
+!is.na(PULocationID),
+!is.na(distance_miles),
+!is.na(total_fare),
+distance_miles > 0,
+total_fare    > 0,
+trip_minutes >= 1,
+trip_minutes <= 180
+)
+
+# Raw counts by period and provider
+
+raw_counts <- night_qc_raw %>%
+group_by(period, provider) %>%
+summarize(
+raw_trips = n(),
+.groups   = "drop"
+)
+
+# Cleaned counts by period and provider
+
+clean_counts <- night_qc_clean %>%
+group_by(period, provider) %>%
+summarize(
+clean_trips = n(),
+.groups     = "drop"
+)
+
+# Join and compute retention / removal rates
+
+retention_table <- raw_counts %>%
+left_join(clean_counts, by = c("period", "provider")) %>%
+mutate(
+clean_trips = replace_na(clean_trips, 0L),
+pct_kept    = (clean_trips / raw_trips) * 100,
+pct_removed = 100 - pct_kept
+) %>%
+arrange(period, provider)
+
+cat("\nTrip retention after cleaning (consistent sample, by period and provider):\n")
+# print(retention_table)
+
+knitr::kable(
+  retention_table,
+  format = "html",
+  caption = "Trip Retention After Cleaning (by COVID Period and Provider)",
+  digits = 2
+)
+
+```
+
+##### Interpretation
+
+The trip-retention results show that the TLC night-time dataset is extremely clean, with very few records removed during the validity filtering stage. Across all COVID periods and providers, **95–100%** of trips were retained after applying quality rules (positive distance, positive fare, and realistic duration between 1 and 180 minutes).
+
+High-volume rideshare trips (FHVHV) consistently show retention **above 98%**, indicating highly stable and reliable data collection. Yellow taxis show slightly lower retention **(96–98%)**, driven mainly by short or zero-fare trips that were filtered out.
+
+These results confirm that the TLC Parquet data is high quality and highly suitable for detailed analysis, with negligible noise or invalid entries. Outlier removal affects less than **1–4%** of the dataset, ensuring the cleaned dataset remains representative of true night-time mobility patterns in pre-COVID, COVID, and post-COVID periods.
+
+---
+
+#### Data Suitability: TLC Trips and Yelp Nightlife
+
+In this section, I briefly check how well-covered the city is in my final zone-level panel by counting how many taxi zones have TLC night trips and how many also have Yelp nightlife venues. This supports my claim that the combined TLC + Yelp panel is suitable to study night movement and nightlife intensity.
+
+```{r}
+# Basic coverage checks on the zone-level panel
+
+zones_with_trips <- zone_panel %>%
+filter(n_trips > 0) %>%
+summarize(
+n_zones_with_trips = n_distinct(LocationID)
+)
+
+zones_with_nightlife <- zone_panel %>%
+filter(n_trips > 0, n_nightlife > 0) %>%
+summarize(
+n_zones_with_trips_and_nightlife = n_distinct(LocationID)
+)
+
+coverage_summary <- bind_cols(zones_with_trips, zones_with_nightlife)
+
+cat("\nCoverage of TLC night trips and Yelp nightlife across taxi zones:\n")
+# print(coverage_summary)
+knitr::kable(
+  coverage_summary,
+  format = "html",
+  caption = "Coverage of TLC Night Trips and Yelp Nightlife Across Taxi Zones",
+  digits = 0
+)
+
+```
+
+##### Interpretation
+
+The combined TLC–Yelp zone panel shows strong and meaningful coverage for analyzing night movement and nightlife intensity in NYC. **Out of 263 taxi zones in the TLC shapefile, 259 zones (98%)** show at least one night-time trip in my dataset across the **2019–2023** period. This confirms that night mobility is widely distributed across the city and that TLC data provides near-universal geographic coverage.
+
+Among these active zones, 64 zones contain at least one nightlife venue recorded in Yelp. This is expected because Yelp nightlife businesses (bars, clubs, lounges, entertainment venues) are highly concentrated in a few well-known neighborhoods rather than uniformly across all zones.
+
+This zoning pattern reveals an important feature of the data: while night-time trips occur almost everywhere, nightlife activity is geographically clustered, which is exactly what we want to study. The overlap between TLC trips and Yelp venues allows me to compare how mobility patterns changed specifically in nightlife districts versus the rest of the city.
+
+Overall, the data coverage confirms that TLC trips provide a comprehensive picture of citywide night movement, while Yelp provides focused and meaningful coverage of nightlife hubs. Together, they form a suitable and well-aligned dataset for answering how COVID reshaped night-time mobility in NYC.
+
+---
+
+#### Night-Time Feature Engineering for EDA
+
+In this section, I create a compact night_trips_eda dataset with all the time-based variables I need for EDA: hour of pickup, date, day-of-week, weekend flag, and COVID period. This will be the base table for all later plots.
+
+```{r}
+# I construct a trip-level EDA dataset with key time features
+
+night_trips_eda <- night_trips_clean %>%
+
+# Make sure the COVID period label is present
+
+mutate(
+period = if (!"period" %in% names(.)) covid_period_from_ym(ym) else period,
+pickup_hour = hour(pickup_time),
+pickup_date = as.Date(pickup_time),
+dow         = wday(pickup_time, label = TRUE, abbr = TRUE, week_start = 1),
+is_weekend  = dow %in% c("Fri", "Sat")
+) %>%
+
+# Keep only the variables I actually need for EDA
+
+select(
+ym,
+period,
+pickup_time,
+pickup_date,
+pickup_hour,
+dow,
+is_weekend,
+provider,
+distance_miles,
+trip_minutes
+)
+
+cat("Preview of night_trips_eda with new time features:\n")
+# print(head(night_trips_eda))
+knitr::kable(
+  head(night_trips_eda, 6),
+  format = "html",
+  caption = "Preview of night_trips_eda with New Time Features",
+  digits = 2
+)
+
+```
+
+##### Interpretation
+
+The preview confirms that my night_trips_eda dataset was successfully constructed with all required time-based features for EDA. Each night trip now includes:
+
+  a) pickup_hour (e.g., 20, 21, 23)
+  b) pickup_date
+  c) day-of-week (dow) such as Tue, Fri, Sat
+  d) is_weekend flag correctly identifying Fri/Sat as weekend nights
+  e) period assigned correctly as **pre-COVID, during-COVID, or post-COVID**
+  f) trip-level metrics: distance_miles and trip_minutes
+
+This confirms that the data is clean, consistently formatted, and contains all variables needed to explore hourly patterns, weekend vs weekday behavior, and changes in night-time movement across COVID periods. The preview also shows a variety of providers **(Yellow + FHVHV)** and a realistic mix of distances and durations, indicating good suitability for downstream analysis.
+
+---
+
+#### Hourly Night Movement by COVID Period
+
+In this section, I explore whether the shape of night-time movement changed by comparing how many trips occur at each hour of the night (8 PM–4 AM) across pre-COVID, during-COVID, and post-COVID periods.
+
+```{r}
+#| label: hourly_movement_plot
+#| echo: false
+#| message: false
+#| warning: false
+#| fig.cap: "Night trips by hour (8 PM–4 AM) across pre-, during-, and post-COVID periods."
+
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+
+# Aggregate trips by COVID period and night hour
+
+hourly_counts <- night_trips_eda %>%
+group_by(period, pickup_hour) %>%
+summarize(
+n_trips = n(),
+.groups = "drop"
+) %>%
+
+# Keep only the night hours (should already be the case, but I enforce it)
+
+filter(pickup_hour >= 20 | pickup_hour < 4) %>%
+
+# For nicer plotting, order periods
+
+mutate(
+period = factor(period, levels = c("pre_covid", "during_covid", "post_covid"))
+)
+
+cat("Hourly night-time trip counts by COVID period:\n")
+# print(head(hourly_counts))
+
+knitr::kable(
+  head(hourly_counts, 6),
+  format = "html",
+  caption = "Hourly Night-Time Trip Counts by COVID Period",
+  digits = 0
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+hourly_counts_wrap <- night_trips_clean |>
+mutate(
+hour = hour(pickup_time),
+hour = if_else(hour < 4, hour + 24L, hour)  # so 0–3 become 24–27
+) |>
+filter(hour >= 20 & hour <= 28) |>
+count(period, hour, name = "n_trips")
+
+ggplot(hourly_counts_wrap, aes(x = hour, y = n_trips, color = period)) +
+geom_line(linewidth = 1) +
+scale_x_continuous(
+breaks = c(20, 21, 22, 23, 24, 25, 26, 27, 28),
+labels = c("8 PM","9 PM","10 PM","11 PM","12 AM","1 AM","2 AM","3 AM","4 AM")
+) +
+labs(
+x = "Hour of Night",
+y = "Number of Trips",
+color = "COVID period"
+) +
+theme_minimal()
+```
+
+##### Interpretation
+
+The hourly pattern clearly shows that COVID dramatically changed the shape and intensity of night-time mobility in NYC.
+
+**Pre-COVID (red line):**
+
+Pre-COVID nights follow a classic nightlife curve: moderate activity at 8–10 PM, strong peak around 11 PM–midnight, and a slow decline after 1 AM. This reflects a normal, healthy nightlife pattern where late-night trips dominate.
+
+**During COVID (green line):**
+
+Night trips collapsed across all hours, with the sharpest collapse after 10 PM. Midnight–3 AM movement nearly disappears, showing that late-night behavior was hit the hardest. The small bump around 20–21 PM suggests that essential travel continued, but nightlife itself was largely shut down.
+
+**Post-COVID (blue line):**
+
+Night mobility rebounds significantly—higher than both pre-COVID and during COVID for nearly every hour. The strongest recovery occurs in the late-night period (22:00–24:00), where the post-COVID line rises steeply. The early-morning hours (0–3 AM) also show a strong recovery compared to 2020, but still show a visible dip, suggesting nightlife has recovered but not fully normalized.
+
+**Overall:**
+COVID caused a structural shift in the night-time movement curve:
+
+**The late-night dip during COVID is extremely deep.**
+**Post-COVID nights start earlier and rise more steeply but still show a softer tail after 1 AM compared to pre-COVID.** 
+
+This confirms that COVID changed both the level and timing of how the city moves at night.
+
+---
+
+#### Weekend vs Weekday Night Movement
+
+In this section, I separate weekend and weekday night trips and build an interactive plot. When I hover over a point, a tooltip shows the hour, number of trips, period, and whether it’s a weekday or weekend, which makes it easier to explore patterns without cluttering the chart.
+
+```{r}
+#| label: fig_weekend_weekday
+#| echo: false
+#| message: false
+#| warning: false
+#| fig.cap: "Weekend vs weekday night trips (8 PM–4 AM) by COVID period."
+
+weekend_hourly_counts <- night_trips_eda %>%
+group_by(period, is_weekend, pickup_hour) %>%
+summarize(
+n_trips = n(),
+.groups = "drop"
+) %>%
+filter(pickup_hour >= 20 | pickup_hour < 4) %>%
+mutate(
+period      = factor(period, levels = c("pre_covid", "during_covid", "post_covid")),
+weekend_lab = if_else(is_weekend, "Weekend (Fri–Sat)", "Weekday (Sun–Thu)")
+)
+
+knitr::kable(
+  head(weekend_hourly_counts, 6),
+  format  = "html",
+  caption = "Weekend vs Weekday Night-Time Trip Counts (Sample Rows)",
+  digits  = 0
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+weekend_hourly_wrap <- night_trips_clean |>
+mutate(
+hour = hour(pickup_time),
+hour = if_else(hour < 4, hour + 24L, hour),
+wday   = wday(pickup_time, label = TRUE),
+is_weekend = wday %in% c("Sat", "Sun")
+) |>
+filter(hour >= 20 & hour <= 28) |>
+count(is_weekend, period, hour, name = "n_trips")
+
+ggplot(weekend_hourly_wrap,
+aes(x = hour, y = n_trips, color = period, linetype = is_weekend)) +
+geom_line(linewidth = 1) +
+scale_x_continuous(
+breaks = c(20, 21, 22, 23, 24, 25, 26, 27, 28),
+labels = c("8 PM","9 PM","10 PM","11 PM","12 AM","1 AM","2 AM","3 AM","4 AM")
+) +
+labs(
+x = "Hour of Night",
+y = "Number of Trips",
+color = "COVID period",
+linetype = "Weekend?"
+) +
+theme_minimal()
+
+```
+
+##### Interpretation
+
+This visualization clearly shows that COVID reshaped night-time mobility differently for weekdays and weekends, which supports my project’s hypothesis.
+
+**Pre-COVID,** weekend nights (Fri–Sat) show strong late-night activity with a visible peak around 22:00–24:00 — the classic NYC nightlife curve.
+
+**During COVID,** both weekday and weekend mobility collapse, but weekend late-night activity drops almost to zero, indicating that nightlife was nearly shut down.
+
+**Post-COVID,** mobility rebounds across all hours, but the shape changes:
+
+  a) Early evening trips (20:00–22:00) recover strongly.
+  b) Very late-night weekend trips (0:00–3:00) recover much less, suggesting nightlife shifted earlier.
+  c) Weekday nights recover more predictably and more fully than nightlife-driven weekend nights.
+
+This confirms that COVID affected nightlife behavior more severely and more persistently, supporting the project’s overall argument that NYC’s late-night movement pattern has changed even after the city reopened.
+
+---
+
+#### Trip Distance and Duration by COVID Period
+
+In this section, I compare the distribution of trip distances and durations across COVID periods to see whether people’s night trips got shorter, longer, or otherwise structurally different. I keep the same boxplot design but convert them to interactive Plotly charts so hovering shows key values.
+
+```{r}
+distance_duration_summary <- night_trips_eda %>%
+group_by(period) %>%
+summarize(
+mean_distance = mean(distance_miles, na.rm = TRUE),
+median_distance = median(distance_miles, na.rm = TRUE),
+mean_minutes  = mean(trip_minutes, na.rm = TRUE),
+median_minutes = median(trip_minutes, na.rm = TRUE),
+.groups = "drop"
+)
+
+# cat("Summary of distance and duration by COVID period:\n")
+# print(distance_duration_summary)
+
+knitr::kable(
+  distance_duration_summary,
+  format  = "html",
+  caption = "Summary of Distance and Duration by COVID Period",
+  digits  = 2
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Boxplot: distance by period
+
+ggplot(night_trips_eda, aes(x = period, y = distance_miles, fill = period)) +
+geom_boxplot(outlier.alpha = 0.2) +
+coord_cartesian(ylim = c(0, quantile(night_trips_eda$distance_miles, 0.99, na.rm = TRUE))) +
+labs(
+title = "Night Trip Distance Distribution by COVID Period",
+x     = "COVID Period",
+y     = "Trip Distance (miles)"
+) +
+theme_minimal() +
+theme(legend.position = "none")
+
+# Boxplot: duration by period
+
+ggplot(night_trips_eda, aes(x = period, y = trip_minutes, fill = period)) +
+geom_boxplot(outlier.alpha = 0.2) +
+coord_cartesian(ylim = c(0, quantile(night_trips_eda$trip_minutes, 0.99, na.rm = TRUE))) +
+labs(
+title = "Night Trip Duration Distribution by COVID Period",
+x     = "COVID Period",
+y     = "Trip Duration (minutes)"
+) +
+theme_minimal() +
+theme(legend.position = "none")
+```
+
+##### Interpretation
+
+The boxplots and summary statistics together show a clear structural change in night-time travel behavior across COVID periods.
+
+  **1. Trip Distance**
+      a) Average and median distances were shortest during COVID (mean ≈ 4.75 miles), suggesting people stayed closer to home.
+      b) Post-COVID distances increased the most (mean ≈ 5.22 miles), slightly higher than pre-COVID levels.
+      c) This indicates a rebound effect, where riders began taking longer trips again as nightlife reopened.
+
+  **2. Trip Duration**
+
+      a) Trip durations follow the same pattern: shortest during COVID, longest post-COVID.
+      b) Median duration increased from 12.7 minutes (during COVID) to 14.5 minutes post-COVID, showing that riders were willing to spend more time traveling at night after restrictions eased.
+
+  **3. Overall Pattern**
+      Together, the distance and duration distributions show that COVID temporarily compressed the city’s night-time mobility radius, but after reopening, New Yorkers resumed longer and more spread-out trips—often exceeding pre-COVID levels.
+
+---
+
+#### Provider Mix: Yellow vs Rideshare Across COVID Periods
+
+![](rideshare.png){width="900" fig-align="center"}
+*Rideshare services became a dominant mode of night-time travel — strongly reflected in TLC trip data.*
+
+In this section, I examine how the composition of night trips changed by comparing the share of Yellow cabs versus high-volume for-hire vehicles (Uber/Lyft) across COVID periods.
+
+```{r}
+provider_mix <- night_trips_eda %>%
+  group_by(period, provider) %>%
+  summarize(
+    n_trips = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(period) %>%
+  mutate(
+    total_period_trips = sum(n_trips),
+    share              = n_trips / total_period_trips
+  ) %>%
+  ungroup() %>%
+  mutate(
+    period = factor(period, levels = c("pre_covid", "during_covid", "post_covid")),
+    # Nice label to print inside the bars
+    share_label = scales::percent(share, accuracy = 1)
+  )
+
+# cat("Night-time provider mix by COVID period:\n")
+# print(provider_mix)
+
+knitr::kable(
+  provider_mix,
+  format  = "html",
+  caption = "Night-Time Provider Mix by COVID Period",
+  digits  = 3
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Visually-strong stacked bar chart of provider shares by period
+# (logic is unchanged – only the styling is improved)
+
+ggplot(provider_mix, aes(x = period, y = share, fill = provider)) +
+  # stacked columns
+  geom_col(width = 0.65, color = "white") +
+  
+  # "Glow" text: dark halo + white label in the middle of each segment
+  geom_text(
+    aes(label = share_label),
+    position = position_stack(vjust = 0.5),
+    color = "black", size = 5.5, fontface = "bold", alpha = 0.35
+  ) +
+  geom_text(
+    aes(label = share_label),
+    position = position_stack(vjust = 0.5),
+    color = "white", size = 4.5, fontface = "bold"
+  ) +
+  
+  # Always show 0–100% on the y-axis
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = c(0, 0),
+    limits = c(0, 1)
+  ) +
+  
+  # Nicer custom colors + clearer legend labels
+  scale_fill_manual(
+    values = c("fhvhv" = "#F9735B", "yellow" = "#00C1C7"),
+    name   = "Provider",
+    labels = c("fhvhv" = "Rideshare (FHVHV)", "yellow" = "Yellow taxi")
+  ) +
+  
+  labs(
+    title    = "Provider Mix for Night Trips by COVID Period",
+    subtitle = "Rideshare dominates night-time trips in all periods, especially during COVID",
+    x        = "COVID Period",
+    y        = "Share of Night Trips"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position      = "right",
+    panel.grid.major.x   = element_blank(),
+    panel.grid.minor     = element_blank(),
+    plot.title           = element_text(face = "bold", size = 18),
+    plot.subtitle        = element_text(size = 12),
+    axis.title.x         = element_text(face = "bold", margin = margin(t = 8)),
+    axis.title.y         = element_text(face = "bold", margin = margin(r = 8))
+  )
+```
+
+##### Interpretation
+
+The provider mix shows a dramatic shift toward rideshare services during COVID. Yellow cabs accounted for only **5% of night-time trips**, compared to **21% before COVID.** Although their share **improved after COVID, rising to 13%,** the post-pandemic landscape is still dominated by FHVs, which **captured 87% of all night trips**. This suggests a structural, long-term change in nightlife mobility, with riders relying far more on **Uber/Lyft than traditional taxis.**
+
+---
+
+#### Nightlife Density Across Taxi Zones
+
+In this section, I map how nightlife venues (bars, clubs, etc.) are distributed across NYC taxi zones using my combined TLC–Yelp panel. This shows which parts of the city are true nightlife hotspots vs quieter residential or industrial areas.
+
+```{r}
+#| label: nightlife_density_leaflet
+#| message: false
+#| warning: false
+
+library(sf)
+library(dplyr)
+library(leaflet)
+library(htmltools)
+library(scales)
+
+# 1) Build zone-level nightlife summary from zone_panel
+nightlife_map_df <- zone_panel %>%
+  group_by(LocationID, borough, zone) %>%
+  summarize(
+    n_nightlife = max(n_nightlife, na.rm = TRUE),
+    avg_rating  = mean(avg_rating, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  mutate(
+    n_nightlife = ifelse(is.infinite(n_nightlife), 0L, n_nightlife)
+  )
+
+# 2) Read TLC taxi zones geometry
+taxi_dir  <- file.path(base_dir, "tlc_zones")
+zones_sf  <- st_read(
+  dsn   = taxi_dir,
+  layer = "taxi_zones",
+  quiet = TRUE
+) %>%
+  st_transform(4326) %>%
+  select(LocationID, geometry)
+
+# 3) Join geometry with nightlife counts
+nightlife_map_sf <- zones_sf %>%
+  left_join(nightlife_map_df, by = "LocationID")
+
+# cat("Sample of nightlife_map_sf:\n")
+# print(head(nightlife_map_sf))
+
+# Show only attribute columns (hide geometry)
+nightlife_sample <- nightlife_map_sf |>
+  st_drop_geometry() |>
+  head(6)
+
+knitr::kable(
+  nightlife_sample,
+  format  = "html",
+  caption = "Sample of Nightlife Density by Taxi Zone",
+  digits  = 2
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# 4) Define color palette and labels for tooltips
+nightlife_pal <- colorNumeric(
+  palette  = "magma",
+  domain   = nightlife_map_sf$n_nightlife,
+  na.color = "#f0f0f0"
+)
+
+nightlife_labels <- sprintf(
+  "<strong>%s</strong><br/>
+   Borough: %s<br/>
+   Nightlife venues: %s<br/>
+   Avg Yelp rating: %s",
+  ifelse(is.na(nightlife_map_sf$zone), "Unknown zone", nightlife_map_sf$zone),
+  ifelse(is.na(nightlife_map_sf$borough), "Unknown", nightlife_map_sf$borough),
+  comma(nightlife_map_sf$n_nightlife),
+  ifelse(is.na(nightlife_map_sf$avg_rating),
+         "N/A",
+         round(nightlife_map_sf$avg_rating, 1))
+) |> lapply(htmltools::HTML)
+
+# 5) Interactive leaflet map
+leaflet(nightlife_map_sf) |>
+  addProviderTiles("CartoDB.Positron") |>
+  addPolygons(
+    fillColor   = ~nightlife_pal(n_nightlife),
+    weight      = 0.3,
+    color       = "#444444",
+    opacity     = 1,
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(
+      weight       = 2,
+      color        = "black",
+      bringToFront = TRUE
+    ),
+    label        = nightlife_labels,
+    labelOptions = labelOptions(
+      style     = list("font-size" = "12px"),
+      direction = "auto"
+    )
+  ) |>
+  addLegend(
+    "bottomright",
+    pal    = nightlife_pal,
+    values = ~n_nightlife,
+    title  = "Nightlife venues<br>(Yelp count)",
+    opacity = 0.8
+  )
+```
+
+
+##### Interpretation
+
+Most taxi zones in the dataset appear with <NA> borough/zone names and 0 nightlife venues. This is expected because large portions of NYC taxi zones—particularly industrial areas, airports, parks, and low-density residential neighborhoods—have few or no Yelp-listed nightlife businesses.
+
+Only a small set of zones, such as Alphabet City in Manhattan, show non-zero nightlife counts (e.g., 3 venues with an average rating of 4.1). These zones represent true nightlife clusters and are the areas that drive the color variation you see on the map (the purple–yellow hotspots).
+
+---
+
+#### Night Trip Intensity by COVID Period
+
+In this section, I map how night-time trip volumes changed across taxi zones for pre-COVID, during-COVID, and post-COVID periods. This lets me see which parts of the city lost or regained late-night movement.
+
+
+```{r}
+#| label: trips_map_prep
+#| echo: false
+#| message: false
+#| warning: false
+
+# 1) Aggregate night trips by zone and COVID period
+trips_map_df <- zone_panel %>%
+  dplyr::group_by(LocationID, borough, zone, period) %>%
+  dplyr::summarize(
+    n_trips_period = sum(n_trips, na.rm = TRUE),
+    .groups        = "drop"
+  ) %>%
+  dplyr::mutate(
+    period = factor(
+      period,
+      levels = c("pre_covid", "during_covid", "post_covid")
+    )
+  )
+
+# 2) Join with taxi-zone geometry so we can draw a map
+trips_map_sf <- zones_sf %>%
+  dplyr::left_join(trips_map_df, by = "LocationID")
+
+# cat("Sample of trips_map_sf:\n")
+# print(head(trips_map_sf))
+
+# Drop geometry and show only the first 6 rows as a clean table
+trips_sample <- trips_map_sf %>%
+  sf::st_drop_geometry() %>%
+  head(6)
+
+knitr::kable(
+  trips_sample,
+  format  = "html",
+  caption = "Sample of Night Trip Intensity by Taxi Zone and COVID Period",
+  digits  = 0
+) %>%
+  kableExtra::kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+```
+
+
+
+```{r}
+library(leaflet)
+library(htmltools)
+library(scales)
+
+# One common color palette so colors are comparable across periods
+trip_pal <- colorNumeric(
+  palette  = "magma",
+  domain   = trips_map_sf$n_trips_period,
+  na.color = "#f0f0f0"
+)
+
+# Split by COVID period for layer toggles
+trips_pre   <- subset(trips_map_sf,  period == "pre_covid")
+trips_during<- subset(trips_map_sf,  period == "during_covid")
+trips_post  <- subset(trips_map_sf,  period == "post_covid")
+
+# Hover labels (HTML) for each zone-period
+trip_labels <- function(data) {
+  sprintf(
+    "<strong>%s</strong><br/>
+     Borough: %s<br/>
+     Period: %s<br/>
+     Night trips (8 PM–4 AM): %s",
+    ifelse(is.na(data$zone),    "Unknown zone", data$zone),
+    ifelse(is.na(data$borough),"Unknown",       data$borough),
+    data$period,
+    comma(data$n_trips_period)
+  ) |>
+    lapply(htmltools::HTML)
+}
+
+# ️Interactive leaflet map with layer control
+leaflet() |>
+  addProviderTiles("CartoDB.Positron") |>
+
+  # Pre-COVID layer
+  addPolygons(
+    data        = trips_pre,
+    fillColor   = ~trip_pal(n_trips_period),
+    weight      = 0.3,
+    color       = "#444444",
+    opacity     = 1,
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(
+      weight      = 2,
+      color       = "black",
+      bringToFront = TRUE
+    ),
+    label       = trip_labels(trips_pre),
+    group       = "Pre-COVID"
+  ) |>
+
+  # During-COVID layer
+  addPolygons(
+    data        = trips_during,
+    fillColor   = ~trip_pal(n_trips_period),
+    weight      = 0.3,
+    color       = "#444444",
+    opacity     = 1,
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(
+      weight      = 2,
+      color       = "black",
+      bringToFront = TRUE
+    ),
+    label       = trip_labels(trips_during),
+    group       = "During COVID"
+  ) |>
+
+  # Post-COVID layer
+  addPolygons(
+    data        = trips_post,
+    fillColor   = ~trip_pal(n_trips_period),
+    weight      = 0.3,
+    color       = "#444444",
+    opacity     = 1,
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(
+      weight      = 2,
+      color       = "black",
+      bringToFront = TRUE
+    ),
+    label       = trip_labels(trips_post),
+    group       = "Post-COVID"
+  ) |>
+
+  # Legend (shared scale)
+  addLegend(
+    "bottomright",
+    pal    = trip_pal,
+    values = trips_map_sf$n_trips_period,
+    title  = "Night trips<br>(8 PM–4 AM)",
+    opacity = 0.8,
+    labFormat = labelFormat(big.mark = ",")
+  ) |>
+
+  # Layer toggle to switch between periods
+  addLayersControl(
+    overlayGroups = c("Pre-COVID", "During COVID", "Post-COVID"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```
+
+##### Interpretation
+
+When I *toggle* the layers:
+
+  **Pre-COVID:** Bright corridors appear along Manhattan and key parts of Brooklyn/Queens, showing dense late-night trip activity in traditional nightlife and job centers. Many zones register several thousand trips per period.
+
+  **During COVID:** The map goes mostly dark. Only a small set of zones retain moderate activity (likely essential travel and transport hubs), while classic nightlife zones lose the majority of their 8 PM–4 AM trips. This shows a city-wide collapse in night mobility.
+
+  **Post-COVID:** Night trips rebound sharply and re-concentrate in Manhattan and selected Brooklyn/Queens zones. Some hotspots match or exceed pre-COVID volumes, while others remain muted, indicating an uneven, spatially selective recovery of the night economy.
+
+So this map gives me a strong, visual piece of evidence that COVID dramatically reduced night-time trips citywide and that the recovery has been geographically uneven, directly supporting our sub-question and linking back to the overarching “nightlife and urban economy” theme.
+
+---
+
+#### Mapping Change: Post-COVID vs Pre-COVID Night Trips
+
+In this section, I compute and map the ratio of post-COVID to pre-COVID night trips for each taxi zone. This highlights where night-time mobility has bounced back, stagnated, or even grown beyond pre-COVID levels.
+
+```{r}
+change_ratio_df <- zone_panel %>%
+group_by(LocationID) %>%
+summarize(
+trips_pre  = sum(n_trips[period == "pre_covid"],  na.rm = TRUE),
+trips_post = sum(n_trips[period == "post_covid"], na.rm = TRUE),
+.groups    = "drop"
+) %>%
+mutate(
+ratio_post_pre = dplyr::case_when(
+trips_pre == 0 & trips_post == 0 ~ NA_real_,   # no activity in either period
+trips_pre == 0 & trips_post > 0  ~ NA_real_,   # avoid infinite ratios; treat as special case
+TRUE                             ~ trips_post / trips_pre
+),
+# For mapping, cap very extreme ratios for a nicer color scale
+ratio_capped = pmin(ratio_post_pre, 3)
+)
+
+# cat("Sample of change_ratio_df:\n")
+# print(head(change_ratio_df))
+
+change_ratio_preview <- head(change_ratio_df, 6)
+
+knitr::kable(
+  change_ratio_preview,
+  format  = "html",
+  caption = "Sample of Post-/Pre-COVID Night Trip Ratios by Taxi Zone",
+  digits  = 2
+) |>
+  kableExtra::kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Join to geometry
+
+change_ratio_sf <- zones_sf %>%
+left_join(change_ratio_df, by = "LocationID")
+
+# cat("Sample of change_ratio_sf:\n")
+# print(head(change_ratio_sf))
+
+change_ratio_sf_preview <- change_ratio_sf |>
+  sf::st_drop_geometry() |>
+  dplyr::select(LocationID, trips_pre, trips_post, ratio_post_pre, ratio_capped) |>
+  head(6)
+
+knitr::kable(
+  change_ratio_sf_preview,
+  format  = "html",
+  caption = "Sample of Post-/Pre-COVID Night Trip Ratios (no geometry)",
+  digits  = 2
+) |>
+  kableExtra::kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Choropleth of post/pre night-trip ratios
+
+ggplot(change_ratio_sf) +
+geom_sf(aes(fill = ratio_capped), color = NA) +
+scale_fill_viridis_c(
+option = "C",
+na.value = "grey90",
+name     = "Post / Pre\nnight trips",
+breaks   = c(0.5, 1, 2, 3),
+labels   = c("0.5×", "1×", "2×", "≥3×")
+) +
+labs(
+title    = "Change in Night-Time Mobility: Post-COVID vs Pre-COVID",
+subtitle = "Ratio of total 8 PM–4 AM trips (post_covid / pre_covid) by taxi zone",
+x = NULL,
+y = NULL
+) +
+theme_minimal() +
+theme(
+axis.text       = element_blank(),
+panel.grid      = element_blank(),
+plot.title      = element_text(face = "bold"),
+legend.position = "right"
+)
+```
+
+##### Interpretation
+
+The post-COVID to pre-COVID ratio map shows clear spatial variation in how night-time mobility recovered across NYC. Zones shaded **yellow/orange (ratio ≥ 2×)** indicate areas where night trips more than doubled compared to pre-COVID levels. Many of these high-growth zones appear in parts of **Northern Manhattan, Queens, and Brooklyn,** suggesting strong rebounds or even expansion in late-night activity.
+
+In contrast, zones shaded purple **(ratio < 1×)** represent neighborhoods where post-COVID night trips remain below pre-COVID levels. These areas experienced a weaker recovery and may reflect persistent changes in nightlife demand or local economic activity.
+
+Overall, the map highlights that New York’s night time mobility recovery was **uneven and highly neighborhood specific** some districts bounced back strongly, while others still lag behind pre-pandemic volumes.
+
+---
+
+#### Nightlife vs Night Trips: Zone-Level Relationship
+
+In this section, I explore how nightlife intensity (Yelp venues) relates to night-time trip volumes at the zone level, and whether this relationship changed across COVID periods. I use scatter plots of n_trips vs n_nightlife, colored by nightlife bin and faceted by period.
+
+```{r}
+zone_period_agg <- zone_panel %>%
+group_by(LocationID, borough, zone, nightlife_bin, n_nightlife, period) %>%
+summarize(
+n_trips_period = sum(n_trips, na.rm = TRUE),
+.groups        = "drop"
+) %>%
+mutate(
+period = factor(period, levels = c("pre_covid", "during_covid", "post_covid")),
+nightlife_bin = factor(
+nightlife_bin,
+levels = c("No nightlife venues", "1–5 venues", "6–15 venues", "16+ venues")
+)
+)
+
+# cat("Sample of zone_period_agg:\n")
+# print(head(zone_period_agg))
+
+zone_period_agg_preview <- head(zone_period_agg, 6)
+
+knitr::kable(
+  zone_period_agg_preview,
+  format  = "html",
+  caption = "Sample of Zone-Level Panel: Nightlife vs Night Trips",
+  digits  = 0
+) |>
+  kableExtra::kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Scatter plot: nightlife vs night trips by period
+
+ggplot(zone_period_agg,
+aes(x = n_nightlife, y = n_trips_period, color = nightlife_bin)) +
+geom_point(alpha = 0.7, size = 2) +
+scale_y_continuous(labels = scales::comma) +
+scale_x_continuous(breaks = c(0, 5, 10, 20, 40)) +
+labs(
+title    = "Night Trips vs Nightlife Intensity by Taxi Zone",
+subtitle = "Comparing how nightlife venues translate into night trips across COVID periods",
+x        = "Number of nightlife venues in zone (Yelp)",
+y        = "Night trips per period (8 PM–4 AM)",
+color    = "Nightlife bin"
+) +
+facet_wrap(~ period, scales = "free_y") +
+theme_minimal()
+```
+
+##### Interpretation
+
+This figure shows how strongly nightlife intensity is tied to night-time mobility, and how COVID reshaped that link:
+
+**Pre-COVID:**
+  Points with more venues (green/blue dots at x > 0) tend to sit higher on the y-axis, meaning zones with more    bars/clubs generate more night trips. Classic nightlife zones produce **5,000–15,000+** trips per period, while     “no-nightlife” zones (red, x=0) cluster at much lower volumes except for special cases like airports.
+
+**During COVID:**
+  The entire cloud of points drops downward. Even zones with nightlife venues see a large reduction in trips,     and many “no-nightlife” zones sit close to zero. The relationship between venues and trips flattens, showing    that COVID weakens the normal “more venues → more trips” pattern.
+
+**Post-COVID:**
+  The cloud lifts sharply, especially for zones with nightlife (green/blue points). Many nightlife zones now      reach or exceed their pre-COVID trip volumes, but some remain lower, giving a wider vertical spread. This       indicates a partial but uneven recovery: some nightlife districts bounce back strongly, others lag.
+
+**Overall, the plot cleanly supports:**
+
+TLC night trips and Yelp nightlife are tightly linked at the zone level, **COVID temporarily broke that link, and the post-COVID recovery has been strong but not uniform across NYC’s nightlife neighborhoods.**
+
+---
+
+#### Advanced Inference: Did COVID Change Night Movement?
+
+#### Nightly aggregation: one row per (date, period)
+
+In this section, I aggregate all night-time TLC trips into a nightly panel dataset. Each row represents one night (8 PM–4 AM) with total trip volume and average distance/duration. This transformation converts millions of micro-level trips into a structured daily time series, which is essential for statistical inference. The nightly dataset allows me to formally test whether average night mobility changed across pre-COVID, during-COVID, and post-COVID periods.
+
+```{r}
+#| label: nightly_agg
+#| code-fold: true
+#| message: false
+#| warning: false
+
+library(dplyr)
+
+nightly_agg <- night_trips_eda %>%
+group_by(pickup_date, period) %>%
+summarize(
+nightly_trips   = n(),
+avg_distance    = mean(distance_miles, na.rm = TRUE),
+avg_duration    = mean(trip_minutes, na.rm = TRUE),
+.groups         = "drop"
+) %>%
+
+# ensure period factor order is consistent everywhere
+
+mutate(
+period = factor(period, levels = c("pre_covid", "during_covid", "post_covid"))
+)
+
+cat("Preview of nightly aggregation (one row per date × COVID period):\n")
+
+knitr::kable(
+head(nightly_agg, 10),
+format  = "html",
+caption = "Nightly Aggregation: Total Night Trips and Averages by Date and COVID Period",
+digits  = 2
+) |>
+kableExtra::kable_styling(
+full_width        = FALSE,
+bootstrap_options = c("striped", "hover")
+)
+
+```
+
+
+##### Interpretation:
+
+Looking at the nightly aggregation, the results immediately reveal the expected structure of NYC night mobility. Pre-COVID nights **(e.g., 2019-06-01 with 12,686 trips)** show strong, stable late-night activity typical of New York nightlife. During earlier years or low-volume days, nightly trips are naturally small, but the main signal is the high and sustained pre-COVID volumes. Average trip distance **(≈4.5–5.0 miles)** and duration **(≈16 minutes)** reflect typical cross-borough and Manhattan-bound nightlife travel. This nightly panel confirms that the dataset captures real nighttime behavior and sets up the foundation for the formal inference tests that follow.
+
+---
+
+#### Bootstrap & permutation tests: mean nightly trips by period
+
+In this section, I formally test whether COVID caused statistically significant changes in nightly mobility. Using the nightly aggregation table, I apply bootstrapping to estimate confidence intervals for the difference in mean nightly trips across periods. I also run permutation tests to generate exact non-parametric p-values that do not rely on distributional assumptions. Together, these inference techniques provide rigorous evidence that nightly movement patterns changed substantially across the pre-COVID, during-COVID, and post-COVID periods.
+
+```{r}
+#| label: nightly_bootstrap_permutation
+#| code-fold: true
+#| message: false
+#| warning: false
+
+library(dplyr)
+
+set.seed(9750)  # for reproducibility
+
+# Helper: bootstrap CI for mean nightly trips difference between two periods
+
+bootstrap_diff <- function(data, period_a, period_b, B = 1000) {
+x <- data$nightly_trips[data$period == period_a]
+y <- data$nightly_trips[data$period == period_b]
+
+# observed difference
+
+obs_diff <- mean(x) - mean(y)
+
+# bootstrap
+
+boot_diffs <- replicate(B, {
+mean(sample(x, replace = TRUE)) - mean(sample(y, replace = TRUE))
+})
+
+ci <- quantile(boot_diffs, probs = c(0.025, 0.975), na.rm = TRUE)
+
+tibble(
+period_a   = period_a,
+period_b   = period_b,
+obs_diff   = obs_diff,
+ci_lower   = ci[1],
+ci_upper   = ci[2]
+)
+}
+
+# Helper: permutation test for mean difference
+
+perm_test_diff <- function(data, period_a, period_b, B = 2000) {
+sub <- data %>%
+filter(period %in% c(period_a, period_b)) %>%
+mutate(period = droplevels(period))
+
+x <- sub$nightly_trips[sub$period == period_a]
+y <- sub$nightly_trips[sub$period == period_b]
+
+obs_diff <- mean(x) - mean(y)
+pooled   <- sub$nightly_trips
+
+perm_diffs <- numeric(B)
+for (b in seq_len(B)) {
+perm_labels <- sample(sub$period)  # shuffle labels
+perm_diffs[b] <- mean(pooled[perm_labels == period_a]) -
+mean(pooled[perm_labels == period_b])
+}
+
+# two-sided p-value
+
+p_value <- mean(abs(perm_diffs) >= abs(obs_diff))
+
+tibble(
+period_a = period_a,
+period_b = period_b,
+obs_diff = obs_diff,
+p_value  = p_value
+)
+}
+
+# Define period pairs to compare
+
+period_pairs <- list(
+c("pre_covid",   "during_covid"),
+c("pre_covid",   "post_covid"),
+c("during_covid","post_covid")
+)
+
+# Run bootstrap CI for each pair
+
+boot_results <- purrr::map_dfr(
+period_pairs,
+~bootstrap_diff(nightly_agg, .x[1], .x[2])
+)
+
+# Run permutation test for each pair
+
+perm_results <- purrr::map_dfr(
+period_pairs,
+~perm_test_diff(nightly_agg, .x[1], .x[2])
+)
+
+# Combine results
+
+inference_results <- boot_results %>%
+left_join(
+perm_results,
+by = c("period_a", "period_b", "obs_diff")
+) %>%
+mutate(
+obs_diff = round(obs_diff, 1),
+ci_lower = round(ci_lower, 1),
+ci_upper = round(ci_upper, 1),
+p_value  = signif(p_value, 3)
+)
+
+cat("Bootstrap confidence intervals and permutation-test p-values\nfor differences in mean nightly trips:\n")
+
+knitr::kable(
+inference_results,
+format  = "html",
+caption = "Differences in Mean Nightly Trips Across COVID Periods",
+col.names = c("Period A", "Period B", "Diff (A − B)", "CI Lower", "CI Upper", "Permutation p-value")
+) |>
+kableExtra::kable_styling(
+full_width        = FALSE,
+bootstrap_options = c("striped", "hover")
+)
+```
+
+##### Interpretation:
+
+The results provide overwhelming statistical evidence that COVID reshaped night-time mobility in New York City. Pre-COVID nights averaged **~6,000 more trips per night** than during COVID, with a tight 95% CI entirely above zero. Similarly, post-COVID nights averaged **~2,000 more trips than pre-COVID nights**, indicating that night mobility not only recovered but surpassed pre-pandemic levels. Finally, the strong negative difference between during-COVID and post-COVID **(≈ −4,000 trips)** confirms a dramatic rebound after restrictions eased. All permutation p-values are effectively 0, meaning these differences are statistically definitive.
+
+Together, these inference results prove that the level of night movement changed significantly across the three COVID periods, strongly supporting the sub-question and reinforcing the broader argument about nightlife, urban activity, and city recovery.
+
+---
+
+#### Count model (Poisson / Negative Binomial) on aggregated counts
+
+To formally model how night-time trip intensity changed across COVID periods, I construct a high-resolution panel dataset at the date–hour–zone level. Each row represents the number of trips occurring in a specific taxi zone during a specific hour of the night (8 PM–4 AM), tagged with provider, weekend indicator, and COVID period. This structured dataset allows us to estimate the effect of COVID on night-time mobility while controlling for hourly patterns and geographic variation. It is the required input for Poisson and Negative Binomial count models.
+
+```{r}
+#| label: count_model_prep
+#| code-fold: true
+#| message: false
+#| warning: false
+
+library(dplyr)
+library(lubridate)
+
+# Build modeling dataset: counts per (date, hour, zone, provider, period, weekend)
+
+counts_dhzp <- night_trips_clean %>%
+mutate(
+pickup_date = as.Date(pickup_time),
+pickup_hour = hour(pickup_time),
+dow         = wday(pickup_time, label = TRUE, abbr = TRUE, week_start = 1),
+is_weekend  = dow %in% c("Fri", "Sat")
+) %>%
+group_by(
+pickup_date,
+pickup_hour,
+LocationID = PULocationID,
+provider,
+period,
+is_weekend
+) %>%
+summarize(
+trips = n(),
+.groups = "drop"
+) %>%
+mutate(
+period     = factor(period, levels = c("pre_covid", "during_covid", "post_covid")),
+is_weekend = factor(is_weekend, levels = c(FALSE, TRUE), labels = c("Weekday", "Weekend"))
+)
+
+cat("Preview of count-model dataset (date–hour–zone–provider):\n")
+
+knitr::kable(
+head(counts_dhzp, 10),
+format  = "html",
+caption = "Counts of Night Trips by Date, Hour, Zone, Provider, and COVID Period"
+) |>
+kableExtra::kable_styling(
+full_width        = FALSE,
+bootstrap_options = c("striped", "hover")
+)
+```
+
+##### Interpretation:
+
+The preview confirms that the dataset successfully breaks down nightly movement into hour-by-hour activity across taxi zones and providers. For example, on May 31, 2019 (pre-COVID), zones 107, 137, 151, and others each show small hourly trip counts, which is expected at the zone-hour level. The structure shows that every row corresponds to a unique (date, hour, LocationID, provider) combination, which is ideal for count modeling frameworks. This fine-grained panel format ensures that the upcoming regression model can estimate how COVID affected night mobility after controlling for zone effects, weekend behavior, and time-of-night dynamics.
+
+---
+
+#### Interactive Forest Plot of COVID Period Effects (IRRs)
+
+To understand how COVID reshaped NYC’s nightlife mobility, we move beyond simple counts and test the effect statistically using a count model. By modeling hourly trip totals across zones, providers, and weekends, we can isolate how much trip intensity changed during and after COVID compared to the pre-COVID baseline. This approach produces Incident Rate Ratios (IRRs), a standard tool for interpreting percentage changes in mobility behavior. The forest plot below visualizes these period effects with confidence intervals.
+
+```{r}
+#| label: irr_forest_period_interactive
+#| code-fold: true
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 5
+#| out-width: 80%
+
+library(MASS)
+library(broom)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+
+# Fit Negative Binomial Model (nb_fit)
+nb_fit <- MASS::glm.nb(
+  trips ~ period + is_weekend + pickup_hour + provider,
+  data = counts_dhzp
+)
+
+# CREATE `irr_table` RIGHT HERE  (THIS IS THE LOCATION)
+irr_table <- broom::tidy(
+  nb_fit,
+  exponentiate = TRUE,
+  conf.int     = TRUE
+) %>%
+  mutate(
+    term_clean = case_when(
+      term == "periodduring_covid" ~ "Period: during_covid",
+      term == "periodpost_covid"   ~ "Period: post_covid",
+      TRUE                         ~ term
+    )
+  )
+
+# Filter for period effects (uses irr_table)
+period_effects <- irr_table %>%
+  filter(grepl("^Period:", term_clean))
+
+# Build forest plot
+p_irr <- ggplot(period_effects,
+                aes(x = estimate, y = term_clean)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(xmin = conf.low, xmax = conf.high),
+    width = 0
+  ) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  labs(
+    title    = "COVID Period Effects on Night Trip Intensity",
+    subtitle = "Incident Rate Ratios (IRRs) from Negative Binomial Count Model\nBaseline = pre_covid",
+    x        = "Incident Rate Ratio (IRR)",
+    y        = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+# Convert to interactive plot
+ggplotly(
+  p_irr,
+  tooltip = c("term_clean", "estimate", "conf.low", "conf.high")
+)
+```
+
+##### Interpretation:
+
+The IRR values show how night-time trip intensity changed relative to the pre-COVID baseline (IRR = 1).
+
+ **During COVID,** the IRR is well below 1, meaning night movement collapsed—NYC had dramatically fewer late-night trips than before the pandemic.
+
+ **Post-COVID,** the IRR rises to around 0.80, showing a strong rebound but still not a full return to pre-COVID levels. The dashed vertical line at IRR = 1 helps visualize this: both COVID periods fall to the left of the line, proving night activity was lower than before COVID.
+
+**Overall, the model confirms that COVID sharply reduced night mobility and the recovery remains incomplete, supporting your hypothesis that COVID structurally changed how NYC moves at night.**
+
+---
+
+### Summary of Key Visual Findings
+
+In this section, I summarize the key visual patterns that demonstrate how night-time mobility changed before, during, and after COVID. These plots serve as the core evidence for answering my Sub-Question and directly support the final narrative of this analysis.
+
+#### **Hourly Night Movement by COVID Period**  
+
+> The hourly pattern shows a dramatic shift in how New York City moved at night across the three periods. Before COVID, night trips followed a classic nightlife curve: **steady activity at 8–10 PM, a strong peak around midnight, and a gradual decline toward 3 AM.** During COVID, this entire curve collapses volumes drop by more than half, and the late night peak disappears, **showing how restrictions and reduced nightlife nearly shut down night mobility.** Post-COVID, night travel rebounds sharply, surpassing pre-COVID levels in the early evening, **but the recovery fades after midnight, where activity remains lower than the old 12–3 AM peak.** Overall, the shape and intensity of the curves clearly prove that COVID fundamentally changed the timing and volume of NYC’s night movement.
+
+---
+
+#### **Weekend vs Weekday Night Movement**  
+
+> Weekend nights **(dashed lines)** consistently show **higher trip volumes than weekdays,** reflecting stronger leisure and nightlife activity. During COVID, both patterns collapse, but the **weekend drop is far steeper,** showing that **nightlife-related movement was hit hardest** by restrictions. In the post-COVID period, **weekend trips rebound much faster than weekday trips,** especially around midnight, signaling a strong recovery in social and entertainment travel. Overall, the widening weekend–weekday gap indicates that **nightlife demand returned sooner and more intensely** than routine late-night travel.
+
+---
+
+#### **Trip Distance and Duration by COVID Period**  
+
+> The **distance boxplot** shows that most night trips across all periods were very short, but a small number of **extreme long-distance outliers** appear in every period. These rare trips stretch the scale but do not affect the overall distribution typical travel remained close to zero to a few miles.
+
+> The duration boxplot shows a more meaningful shift: **pre-COVID trips were slightly longer,** while **during COVID trip durations became shorter and more compressed,** reflecting reduced nightlife activity and fewer long, discretionary rides. Post-COVID, durations rise again but still do not fully return to pre-COVID variability.
+
+---
+
+#### **Provider Mix: Yellow vs Rideshare Across COVID Periods**  
+
+> Rideshare providers **(FHVs/FHVHVs)** dominate night travel in every period, and their dominance grows even stronger during and after COVID. Yellow cab share becomes extremely small and fails to recover post-COVID, signaling a **structural long-term shift** in how New Yorkers travel at night. This reinforces that behavioral changes during COVID were not temporary they reshaped the market permanently.
+
+---
+
+#### **Spatial Patterns: Nightlife, Night Trips, and Post-/Pre-COVID Change**  
+
+> Spatial patterns show that night movement is heavily concentrated in Manhattan’s nightlife districts and select zones in Brooklyn and Queens. COVID caused a sharp reduction in night activity everywhere, but the **recovery is spatially uneven:** some zones return to or exceed pre-COVID levels, while others remain far below. The scatter of nightlife venues vs night trips shows that the usual link between “more nightlife → more trips” weakens during COVID but partially re-emerges afterward, highlighting **a disrupted but gradually re-stabilizing urban nightlife ecosystem.**
+
+---
+
+#### **Statistical Evidence: Bootstrapping, Permutation Tests, and IRR Estimates**  
+
+> Formal inference confirms that these patterns are not random noise. Bootstrap confidence intervals and permutation tests show that the declines in nightly trip volumes during COVID are **statistically significant,** far exceeding normal variation. The negative binomial model’s IRR estimates indicate that night-trip **intensity dropped** sharply during COVID and **rebounds strongly but not fully post-COVID.** These results validate that COVID caused **real structural changes** in nighttime mobility.
+
+---
+
+### Findings: How COVID Changed Night-Time Movement
+
+![](nightlife.png){width="100%" fig-align="center"}
+*A typical NYC nightlife corridor with dense bars and clubs (Lower East Side / East Village).*
+
+> 1. Hourly movement patterns shifted dramatically.
+
+Pre-COVID nights follow a classic nightlife curve, peaking around midnight. During COVID, the curve collapses across all hours especially after 10 PM. Post-COVID, early night travel rebounds strongly, but late-night (12–3 AM) activity remains well below pre-COVID levels.
+
+> 2. Weekends were hit harder and recovered faster.
+
+Weekend nights always had higher activity, but during COVID, weekend travel drops far more sharply than weekdays. After COVID, weekend mobility rebounds more quickly, showing nightlife driven travel returned before general late night travel.
+
+> 3. Trips became shorter and more uniform during COVID.
+
+Distance distributions remain similar, but duration boxplots show trips becoming shorter and less variable during COVID. This suggests fewer long, discretionary, cross-borough trips linked to entertainment.
+
+> 4. Rideshare dominance intensified after COVID.
+
+FHVs (Uber/Lyft) hold the majority of night trips in all periods, and their share rises post-COVID. Yellow taxi activity stays low and does not recover, indicating a lasting shift in night time transportation preferences.
+
+> 5. Nightlife venue density remains a strong mobility predictor.
+
+Zones with more Yelp nightlife venues consistently generate more night trips across all periods. The relationship holds, but volumes fall sharply during COVID and only partially recover afterward.
+
+> 6. Spatial recovery is uneven across NYC.
+
+ Post/pre maps show Manhattan nightlife hubs experienced the steepest declines. Some outer borough zones rebound faster, reflecting shifting nighttime movement patterns.
+
+> 7. Statistical evidence confirms the changes are real.
+
+IRR estimates show night trip intensity fell significantly during COVID and remains below baseline post-COVID. Bootstrapped intervals reinforce that these shifts are statistically meaningful.
+
+---
+
+### Bridging to the Overarching Question
+
+COVID reshaped both the volume and timing of night travel, directly affecting nightlife dependent neighborhoods. Places with the most nightlife experienced the largest mobility declines, revealing reduced economic activity and weaker late night presence. These shifts also influence safety changes in when and where people move at night modify the vibrancy and visibility of urban streets.
+
+---
+
+### Limitations
+
+> a) Partial temporal coverage:
+The analysis uses selected months and years (e.g., June/December), not full-year daily data, which may miss finer seasonal patterns.
+
+> b) Data scale and computational limits:
+TLC trip data is massive (millions of records), requiring sampling and aggregation, which may smooth out rare patterns.
+
+> c) Nightlife venue approximation:
+Yelp captures many nightlife venues, but coverage is incomplete and some listings may be misclassified.
+
+> d) Simplified COVID period definitions:
+Treating “pre,” “during,” and “post-COVID” as three fixed periods cannot fully capture gradual policy and behavioral changes.
+
+> e) Scope of outcomes: 
+My part of the project focuses on mobility as a proxy for nightlife activity. Direct economic or safety outcomes are analyzed by my teammates, not in this section.
+
+---
+
+
+### Reference 
+
+> NYC Taxi & Limousine Commission (TLC) — Trip Record Data
+  https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page. Used for all night-time trip    counts (8 PM–4 AM) across pre-, during-, and post-COVID periods.
+
+> TLC Taxi Zone Shapefile — Borough & Zone Geometry
+  https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip. Used for spatial joins and         mapping night-trip intensity by zone.
+
+> Yelp Open Dataset — Business Listings for Academic Use
+  https://www.yelp.com/dataset. Used to approximate nightlife intensity through counts of       bars, clubs, and entertainment venues.
+
+> R & Key Packages: tidyverse, sf, arrow, ggplot2, viridis, plotly, MASS, broom, kableExtra.    Used for data cleaning, geospatial processing, visualization, and statistical modeling.
+
+---
+
+
+
+
+
+
+
+
+
