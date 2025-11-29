@@ -8,7 +8,7 @@
 # Quarto / R Markdown output
 *_cache/
 *_files/
-*.html
+
 
 # Raw / large data (reproducible from code)
 data/tlc/
