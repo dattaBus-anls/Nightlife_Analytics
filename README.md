@@ -29,7 +29,7 @@ All results are documented in `quarto/Nightlife Analytics.qmd` and rendered to H
 
 ---
 
-## 2. Key Findings (Short Summary)
+## 2. Key Findings
 
 - **Hourly pattern shifted.** Pre-COVID nights follow a classic nightlife curve with a strong midnight peak. During COVID, the curve collapses across all hours; late-night (midnight–3 AM) nearly disappears. Post-COVID, early evening trips rebound strongly, but the late-night tail remains weaker than pre-COVID.
 
